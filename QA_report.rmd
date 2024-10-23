@@ -1,0 +1,192 @@
+---
+title: "`r i`"
+output: html_document
+date: "`r Sys.Date()`"
+---
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: 0;
+  margin-right: auto;
+}
+</style>
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+options(knitr.table.format = "latex")
+
+ library(kableExtra)
+ library(tidyverse)
+ library(data.table)
+ library(flextable)
+ library(ggplot2)
+ library(viridis)
+ library(patchwork)
+ library(officer)
+
+```
+
+```{r print_plots, include=T,results='asis',out.width='100%'}
+    
+#Take the sleep stages data and filter it to one subject, then reformat columns
+      ss_1sub<-subset(ss_epoch_subset, ID==i) %>% ungroup() %>% 
+        mutate(stage_num=as.numeric(stage_num), E=as.numeric(E),
+               stype=case_when(STAGE=="R" ~ "REM",
+                               STAGE=="N2" | STAGE=="N3" ~ "NREM",
+                               TRUE ~ NA_character_))
+
+#plot hypnogram
+       hypnogram <- ggplot( ss_1sub, aes(x=E, y=stage_num)) + theme_classic() +
+        geom_line(color="gray")+ geom_point(aes(color=STAGE, fill=STAGE),shape=20,size=4) +
+         scale_x_continuous(breaks = seq(0, max(ss_1sub$E), by = 100))+
+         labs(x="Epoch",y="Sleep Stage",title="Hypnogram") + 
+         theme(legend.position="top", aspect.ratio=3/11) +
+         scale_color_manual(values=c("black","red","green","dodgerblue","cyan"),
+                            labels=c("W","N1","N2","N3","REM"),
+                            aesthetics = c("color", "fill"))
+
+#Take the sleep stages and assign them to NREM, REM, or NA so we can plot dropped epochs
+	all_epochs<-ss_1sub %>% mutate(stype=case_when(STAGE=="R"~"REM",STAGE=="N2" | STAGE=="N3" ~ "NREM",TRUE ~ NA_character_)) 
+
+	#Loop through channels and get the by-epoch data: dropped, kept, or not evaluated (ineligible stage)
+	for (v in vars$varname){
+		assign(paste0(v,"_nrem_spectra_1sub"),filter(get(paste0(v,"_nrem_spectra_df")),ID==i))
+		assign(paste0(v,"_rem_spectra_1sub"),filter(get(paste0(v,"_rem_spectra_df")),ID==i))
+		assign(paste0(v,"_nrem_power_1sub"),filter(get(paste0(v,"_nrem_power_df")),ID==i))
+		assign(paste0(v,"_rem_power_1sub"),filter(get(paste0(v,"_rem_power_df")),ID==i))
+		nrem_name=paste0(v,"_EMASK_N")
+		rem_name=paste0(v,"_EMASK_R")		
+		
+		all_epochs <- all_epochs %>% 
+		mutate({{v}}:= case_when(is.na(.data[[nrem_name]])&is.na(.data[[rem_name]])~"NA",
+					.data[[nrem_name]]==0~"ret",
+					.data[[nrem_name]]==1~"rej",
+					.data[[rem_name]]==0~"ret",
+					.data[[rem_name]]==1~"rej"),
+			"{v}_outcome":=ifelse(is.na(stype),NA,paste(stype,.data[[v]],sep="_")))	
+	}
+
+	#pivot the results longer for formatting
+        colnames<-paste0(vars$varname,"_outcome")
+        all_epochs<-pivot_longer(all_epochs, cols=any_of(colnames)) %>% mutate(name=str_remove(name,"_outcome"))
+varlist<-paste(vars$varname,collapse="|")
+        
+#Make a summary table that reports Ns and percentages of rejected/retained epochs by channel, stage, and stage type (REM vs NREM)
+	all_summary<-all_epochs %>%
+         filter(STAGE != "N1" & STAGE != "W") %>%
+         separate(value, into=c("stype","outcome"),sep="_") %>%
+         group_by(STAGE, name) %>%
+         summarize("incl"=sum(outcome=="ret"),excl=sum(outcome=="rej")) %>%
+         mutate(channel=str_remove(name,"_outcome"),
+                Total_epochs=incl+excl,
+                chanstage=paste(channel, STAGE, sep="_")) %>%
+         arrange(channel) %>% 
+         select(chanstage,incl,excl,Total_epochs) %>%
+         data.table::transpose(keep.names="result",make.names="chanstage") %>%
+         ungroup() %>% rowwise()  %>%
+         data.table::transpose(keep.names="chanstage",make.names="result") %>%
+         ungroup() %>% rowwise() %>% select(-STAGE) %>%
+         mutate(percent_included=paste0(round(as.numeric(incl)/as.numeric(Total_epochs)*100,digits=2),"%"),
+                chanstage=str_replace(chanstage,"_R","_REM")) %>%
+         arrange(chanstage) %>% mutate("channel"=str_extract(chanstage,varlist),
+                                       "stage"=str_remove_all(chanstage,paste0(varlist,"|_"))) %>%
+      	select(channel, stage, Total_epochs, percent_included) %>%
+         pivot_wider(id_cols = c(stage,Total_epochs), id_expand = FALSE, names_from = channel, 
+                     names_glue = "{channel}_{.value}", values_from = c(percent_included)) %>% 
+         select(order(colnames(.))) %>% select(stage,everything())
+
+	
+#Plot which epochs were dropped vs kept
+       dropped <- ggplot( all_epochs, aes(x=E, y=name)) + theme_classic() +
+         geom_tile(aes(fill=value)) +
+         scale_x_continuous(breaks = seq(0, max(all_epochs$E), by = 100))+
+         scale_fill_manual(
+           labels=c("NREM Rejected", "NREM Retained", "REM Rejected", "REM Retained",NA),
+           values=c("darkblue","deepskyblue","purple4","orchid","gray20")) +
+         labs(x="Epoch",y="Channel",title="Artifact Rejection By Channel") +
+         theme(legend.position="top", legend.key.size=unit(0.2,"cm"), legend.text = element_text(size=6), legend.title=element_blank(),
+               aspect.ratio=length(vars$varname)/11, 
+               axis.text.y = element_text(angle=45, hjust=0.5,size=6),
+		axis.text.x = element_text(size=6))
+epochcharts<-hypnogram / dropped
+print(epochcharts)
+
+thickline<-fp_border(color = "black", style = "solid", width = 1.5)
+
+
+ref_table <- data.frame(
+  key = colnames(all_summary),
+  label = str_replace_all(colnames(all_summary),"_"," ")
+)
+
+       printtable<-flextable(all_summary) %>%
+        	theme_box() %>% border(border.right = thickline, j = c(1,2), part="body") %>%
+		set_header_df(mapping = ref_table, key = "key") %>%
+		border_outer(border = thickline, part = "all") %>% style(part="all",pr_t=fp_text(font.family='Arial')) %>%
+		fix_border_issues()
+printtable
+```
+         
+```{r print_spectra, include=T,results='asis',out.width='100%'}   
+
+power<-numeric()
+spectral<-numeric()
+
+for (v in vars$varname){
+	for (nr in c("nrem","rem")){
+		df<-get(paste0(v,"_",nr,"_power_1sub"))
+		power<-c(power,log(df$PSD))
+		df<-get(paste0(v,"_",nr,"_spectra_1sub"))
+		spectral<-c(spectral,log(df$PSD))
+	}
+}
+
+power_range<-range(power)
+spectral_range<-range(spectral)
+
+
+
+    # Make spindle spectra for nrem stages and plot them side by side
+
+for (v in vars$varname){
+	df<-get(paste0(v,"_nrem_power_1sub"))
+	temp_nrem_spin<-ggplot(df, aes(x=F,y=log(PSD))) + 
+      		geom_line() + labs(x="Hz",y="Log Power (uV^2/Hz)",title=paste0("nrem ",v))+
+      		ylim(power_range)+
+      		theme_classic()+theme(aspect.ratio=2/4,plot.title = element_text(hjust = 0.5))
+
+	df<-get(paste0(v,"_nrem_spectra_1sub"))
+	temp_nrem_spectrogram<- ggplot( df, aes(x=as.factor(E), y=F)) + theme_classic()+
+             geom_tile(aes(fill=log(PSD))) +
+             scale_fill_viridis(option="H",limits=c(-3,9)) +
+        	scale_y_continuous(breaks=seq(0,25,5))+
+             theme(legend.position="right",axis.line=element_blank(),
+                   axis.ticks.x=element_blank(), #axis.ticks.y=element_blank(),
+                   axis.text.x=element_blank(),#axis.text.y=element_blank(),
+                   aspect.ratio=2/4) + 
+      		xlab("Epoch") + ylab("Hz")
+
+	df<-get(paste0(v,"_rem_power_1sub"))
+	temp_rem_spin<-ggplot(filter(df), aes(x=F,y=log(PSD))) + 
+      		geom_line() + labs(x="Hz",y="Log Power (uV^2/Hz)",title=paste0("rem ",v))+
+     		 ylim(power_range)+
+      		theme_classic()+theme(aspect.ratio=2/4,plot.title = element_text(hjust = 0.5))
+
+	df<-get(paste0(v,"_rem_spectra_1sub"))
+	temp_rem_spectrogram<- ggplot( df, aes(x=as.factor(E), y=F)) + theme_classic()+
+             geom_tile(aes(fill=log(PSD))) +
+             scale_fill_viridis(option="H",limits=c(-3,9)) +
+        	scale_y_continuous(breaks=seq(0,25,5))+
+             theme(legend.position="right",axis.line=element_blank(),
+                   axis.ticks.x=element_blank(), #axis.ticks.y=element_blank(),
+                   axis.text.x=element_blank(),#axis.text.y=element_blank(),
+                   aspect.ratio=2/4) + 
+      		xlab("Epoch") + ylab("Hz")
+
+	temp_fullplot<-temp_nrem_spin + temp_rem_spin + plot_spacer() + temp_nrem_spectrogram + temp_rem_spectrogram +guide_area() + plot_layout(guides="collect",nrow=2)
+
+	print(temp_fullplot)
+}
+
+#https://zzz.bwh.harvard.edu/luna/tut/tut4/
+```
